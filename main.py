@@ -61,7 +61,7 @@ async def check_numbers(request: PhoneNumberRequest):
 
     await client.disconnect()
 
-    # Merge result
+    # Merge results
     results = {}
     for r in results_list:
         results.update(r)
