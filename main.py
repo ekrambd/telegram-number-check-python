@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
+from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
+from telethon.tl.types import InputPhoneContact
 import asyncio
 
 app = FastAPI()
@@ -37,13 +39,29 @@ async def check_numbers(request: PhoneNumberRequest):
     client = TelegramClient(request.session_name, request.app_id, request.api_hash)
     await client.start()
     
-    # asyncio.gather দিয়ে একসাথে সব number check করা
+    temp_contacts = []
+    # Step 1: Prepare temporary contacts
+    for i, number in enumerate(request.phone_numbers):
+        temp_contacts.append(
+            InputPhoneContact(client_id=i, phone=number, first_name="Temp", last_name="User")
+        )
+
+    # Step 2: Import temporary contacts
+    if temp_contacts:
+        await client(ImportContactsRequest(temp_contacts))
+
+    # Step 3: Check each number
     results_list = await asyncio.gather(
         *(check_number(client, number) for number in request.phone_numbers)
     )
+
+    # Step 4: Remove temporary contacts
+    if temp_contacts:
+        await client(DeleteContactsRequest([await client.get_entity(number) for number in request.phone_numbers]))
+
     await client.disconnect()
-    
-    # সব results merge করা
+
+    # Merge results
     results = {}
     for r in results_list:
         results.update(r)
