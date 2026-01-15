@@ -6,83 +6,25 @@ from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContacts
 from telethon.tl.types import InputPhoneContact
 import asyncio
 import os
+import uuid
 
-# =========================
-# APP CONFIG
-# =========================
 app = FastAPI(title="Telegram Number Checker")
 
 BASE_DIR = "/home/ubuntu/telegram-number-check-python"
 SESSION_DIR = f"{BASE_DIR}/sessions"
-
-# Ensure session directory exists & writable
 os.makedirs(SESSION_DIR, exist_ok=True)
 
-# =========================
+# ======================
 # REQUEST MODEL
-# =========================
+# ======================
 class PhoneNumberRequest(BaseModel):
     phone_numbers: list[str]
     app_id: int
     api_hash: str
-    session_name: str = "default"
 
-# =========================
-# CHECK SINGLE NUMBER
-# =========================
-async def check_number(client: TelegramClient, number: str):
-    # 1️⃣ Try direct lookup (already in contacts / known)
-    try:
-        user = await client.get_entity(number)
-        return {
-            number: format_user(user, temp=False)
-        }
-
-    except ValueError:
-        # 2️⃣ Not found → try temp contact import
-        try:
-            temp_contact = InputPhoneContact(
-                client_id=0,
-                phone=number,
-                first_name="Temp",
-                last_name="User"
-            )
-
-            await client(ImportContactsRequest([temp_contact]))
-
-            user = await client.get_entity(number)
-
-            # cleanup
-            try:
-                await client(DeleteContactsRequest([user]))
-            except Exception:
-                pass
-
-            return {
-                number: format_user(user, temp=True)
-            }
-
-        except Exception as e:
-            return {
-                number: {
-                    "exists": False,
-                    "error": str(e),
-                    "temp": True
-                }
-            }
-
-    except Exception as e:
-        return {
-            number: {
-                "exists": False,
-                "error": str(e),
-                "temp": False
-            }
-        }
-
-# =========================
-# FORMAT USER RESPONSE
-# =========================
+# ======================
+# HELPERS
+# ======================
 def format_user(user, temp: bool):
     return {
         "exists": True,
@@ -97,42 +39,69 @@ def format_user(user, temp: bool):
         "temp": temp
     }
 
-# =========================
-# API ENDPOINT
-# =========================
+# ======================
+# CHECK NUMBER
+# ======================
+async def check_number(client: TelegramClient, number: str):
+    try:
+        user = await client.get_entity(number)
+        return {number: format_user(user, temp=False)}
+
+    except ValueError:
+        try:
+            contact = InputPhoneContact(
+                client_id=0,
+                phone=number,
+                first_name="Temp",
+                last_name="User"
+            )
+
+            await client(ImportContactsRequest([contact]))
+            user = await client.get_entity(number)
+
+            try:
+                await client(DeleteContactsRequest([user]))
+            except Exception:
+                pass
+
+            return {number: format_user(user, temp=True)}
+
+        except Exception as e:
+            return {number: {"exists": False, "error": str(e)}}
+
+    except Exception as e:
+        return {number: {"exists": False, "error": str(e)}}
+
+# ======================
+# API
+# ======================
 @app.post("/check")
 async def check_numbers(request: PhoneNumberRequest):
 
-    session_path = f"{SESSION_DIR}/{request.session_name}"
+    session_name = f"{SESSION_DIR}/{uuid.uuid4()}"
+    client = TelegramClient(session_name, request.app_id, request.api_hash)
 
-    client = TelegramClient(
-        session_path,
-        request.app_id,
-        request.api_hash
-    )
-
-    # Start client safely
     try:
         await client.start()
     except SessionPasswordNeededError:
-        raise HTTPException(
-            status_code=401,
-            detail="Two-factor authentication enabled. Login required."
-        )
+        raise HTTPException(401, "Two-factor authentication enabled")
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Telegram client start failed: {str(e)}"
-        )
+        raise HTTPException(500, f"Telegram start failed: {str(e)}")
 
-    # Run all checks concurrently
     results_list = await asyncio.gather(
-        *(check_number(client, num) for num in request.phone_numbers)
+        *(check_number(client, n) for n in request.phone_numbers)
     )
 
     await client.disconnect()
 
-    # Merge results
+    # 🧹 cleanup session files
+    try:
+        for f in os.listdir(SESSION_DIR):
+            if session_name.split("/")[-1] in f:
+                os.remove(f"{SESSION_DIR}/{f}")
+    except Exception:
+        pass
+
     results = {}
     for r in results_list:
         results.update(r)
