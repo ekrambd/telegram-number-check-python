@@ -9,36 +9,28 @@ import os
 
 app = FastAPI(title="Telegram Number Checker")
 
-# ======================
-# DIRECTORIES
-# ======================
 BASE_DIR = "/home/ubuntu/telegram-number-check-python"
 SESSION_DIR = f"{BASE_DIR}/sessions"
 os.makedirs(SESSION_DIR, exist_ok=True)
-
-# Use a permanent session (must login manually once)
-PERMANENT_SESSION = f"{SESSION_DIR}/main"
 
 # ======================
 # REQUEST MODEL
 # ======================
 class PhoneNumberRequest(BaseModel):
     phone_numbers: list[str]
-    app_id: int
-    api_hash: str
 
 # ======================
-# HELPERS
+# FORMAT USER
 # ======================
-def format_user(user, temp: bool):
+def format_user(user, temp=False):
     return {
         "exists": True,
         "id": user.id,
-        "username": getattr(user, "username", None),
-        "first_name": getattr(user, "first_name", None),
-        "last_name": getattr(user, "last_name", None),
-        "phone": getattr(user, "phone", None),
-        "bot": getattr(user, "bot", False),
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "phone": user.phone,
+        "bot": user.bot,
         "verified": getattr(user, "verified", False),
         "premium": getattr(user, "premium", False),
         "temp": temp
@@ -47,14 +39,12 @@ def format_user(user, temp: bool):
 # ======================
 # CHECK NUMBER
 # ======================
-async def check_number(client: TelegramClient, number: str):
+async def check_number(client, number):
     try:
-        # Check if number exists in Telegram
         user = await client.get_entity(number)
-        return {number: format_user(user, temp=False)}
+        return {number: format_user(user)}
 
     except ValueError:
-        # Not in contacts, create temp contact
         try:
             contact = InputPhoneContact(
                 client_id=0,
@@ -62,45 +52,50 @@ async def check_number(client: TelegramClient, number: str):
                 first_name="Temp",
                 last_name="User"
             )
+
             await client(ImportContactsRequest([contact]))
             user = await client.get_entity(number)
+
             try:
                 await client(DeleteContactsRequest([user]))
             except Exception:
                 pass
-            return {number: format_user(user, temp=True)}
-        except Exception as e:
-            return {number: {"exists": False, "error": str(e)}}
 
-    except Exception as e:
-        return {number: {"exists": False, "error": str(e)}}
+            return {number: format_user(user, temp=True)}
+
+        except Exception:
+            return {number: {"exists": False}}
+
+    except Exception:
+        return {number: {"exists": False}}
 
 # ======================
-# API ENDPOINT
+# API
 # ======================
 @app.post("/check")
 async def check_numbers(request: PhoneNumberRequest):
 
-    # Use permanent session
-    client = TelegramClient(PERMANENT_SESSION, request.app_id, request.api_hash)
+    client = TelegramClient(
+        "sessions/main",
+        33281003,
+        "3576c45f67b6223bbb4bf596b861bfb5"
+    )
 
     try:
-        await client.start()  # No interactive input required
+        await client.start()
     except SessionPasswordNeededError:
-        raise HTTPException(401, "Two-factor authentication enabled for this account")
+        raise HTTPException(401, "2FA enabled")
     except Exception as e:
-        raise HTTPException(500, f"Telegram start failed: {str(e)}")
+        raise HTTPException(500, str(e))
 
-    # Check all numbers concurrently
     results_list = await asyncio.gather(
         *(check_number(client, n) for n in request.phone_numbers)
     )
 
     await client.disconnect()
 
-    # Merge results
-    results = {}
+    result = {}
     for r in results_list:
-        results.update(r)
+        result.update(r)
 
-    return results
+    return result
