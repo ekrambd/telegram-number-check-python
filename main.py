@@ -21,6 +21,10 @@ os.makedirs(SESSION_DIR, exist_ok=True)
 
 app = FastAPI(title="Telegram Number Checker")
 
+# 🔒 GLOBAL TELEGRAM CLIENT + LOCK
+client: TelegramClient | None = None
+client_lock = asyncio.Lock()
+
 # ======================
 # REQUEST MODEL
 # ======================
@@ -45,9 +49,39 @@ def format_user(user, temp=False):
     }
 
 # ======================
+# STARTUP: CONNECT ONCE
+# ======================
+@app.on_event("startup")
+async def startup_event():
+    global client
+
+    client = TelegramClient(
+        SESSION_NAME,
+        API_ID,
+        API_HASH
+    )
+
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        raise RuntimeError("Telegram session not authorized")
+
+    print("✅ Telegram client connected")
+
+# ======================
+# SHUTDOWN: DISCONNECT
+# ======================
+@app.on_event("shutdown")
+async def shutdown_event():
+    global client
+    if client:
+        await client.disconnect()
+        print("❌ Telegram client disconnected")
+
+# ======================
 # CHECK NUMBER
 # ======================
-async def check_number(client, number):
+async def check_number(number):
     await asyncio.sleep(0.4)  # anti-ban delay
 
     try:
@@ -88,41 +122,18 @@ async def check_numbers(request: PhoneNumberRequest):
     if not request.phone_numbers:
         raise HTTPException(400, "phone_numbers list is empty")
 
-    client = TelegramClient(
-        SESSION_NAME,
-        API_ID,
-        API_HASH
-    )
-
-    try:
-        await client.connect()
-
-        if not await client.is_user_authorized():
-            raise HTTPException(
-                status_code=401,
-                detail="Telegram session not authorized. Login required."
-            )
-
-    except SessionPasswordNeededError:
-        raise HTTPException(401, "2FA enabled on Telegram account")
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-    # Safety limit
     numbers = request.phone_numbers[:30]
 
-    results_list = await asyncio.gather(
-        *(check_number(client, n) for n in numbers)
-    )
+    results = {}
 
-    await client.disconnect()
-
-    result = {}
-    for r in results_list:
-        result.update(r)
+    # 🔒 LOCK prevents DB locked error
+    async with client_lock:
+        for n in numbers:
+            res = await check_number(n)
+            results.update(res)
 
     return {
         "status": True,
         "total_checked": len(numbers),
-        "data": result
+        "data": results
     }
