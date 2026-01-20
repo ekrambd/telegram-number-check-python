@@ -1,11 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import FloodWaitError
 from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
 from telethon.tl.types import InputPhoneContact
+from contextlib import asynccontextmanager
 import asyncio
 import os
+import logging
 
 # ======================
 # CONFIG
@@ -17,13 +19,41 @@ BASE_DIR = "/home/ubuntu/telegram-number-check-python"
 SESSION_DIR = f"{BASE_DIR}/sessions"
 SESSION_NAME = f"{SESSION_DIR}/main"
 
+MAX_BATCH = 10
+BATCH_DELAY = 2
+
 os.makedirs(SESSION_DIR, exist_ok=True)
 
-app = FastAPI(title="Telegram Number Checker")
+# ======================
+# LOGGING
+# ======================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("telegram-checker")
 
-# 🔒 GLOBAL TELEGRAM CLIENT + LOCK
+# ======================
+# FASTAPI + TELEGRAM
+# ======================
 client: TelegramClient | None = None
 client_lock = asyncio.Lock()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global client
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        raise RuntimeError("Telegram session not authorized")
+
+    log.info("Telegram client connected")
+    yield
+    await client.disconnect()
+    log.info("Telegram client disconnected")
+
+app = FastAPI(title="Telegram Number Checker", lifespan=lifespan)
 
 # ======================
 # REQUEST MODEL
@@ -34,7 +64,7 @@ class PhoneNumberRequest(BaseModel):
 # ======================
 # FORMAT USER
 # ======================
-def format_user(user, temp=False):
+def format_user(user):
     return {
         "exists": True,
         "id": user.id,
@@ -45,92 +75,72 @@ def format_user(user, temp=False):
         "bot": user.bot,
         "verified": getattr(user, "verified", False),
         "premium": getattr(user, "premium", False),
-        "temp": temp
     }
 
 # ======================
-# STARTUP: CONNECT ONCE
+# CORE CHECK (BATCHED)
 # ======================
-@app.on_event("startup")
-async def startup_event():
-    global client
+async def check_batch(numbers: list[str]) -> dict:
+    results = {}
 
-    client = TelegramClient(
-        SESSION_NAME,
-        API_ID,
-        API_HASH
-    )
-
-    await client.connect()
-
-    if not await client.is_user_authorized():
-        raise RuntimeError("Telegram session not authorized")
-
-    print("✅ Telegram client connected")
-
-# ======================
-# SHUTDOWN: DISCONNECT
-# ======================
-@app.on_event("shutdown")
-async def shutdown_event():
-    global client
-    if client:
-        await client.disconnect()
-        print("❌ Telegram client disconnected")
-
-# ======================
-# CHECK NUMBER
-# ======================
-async def check_number(number):
-    await asyncio.sleep(0.4)  # anti-ban delay
+    contacts = [
+        InputPhoneContact(
+            client_id=i,
+            phone=num,
+            first_name="Temp",
+            last_name="User"
+        )
+        for i, num in enumerate(numbers)
+    ]
 
     try:
-        user = await client.get_entity(number)
-        return {number: format_user(user)}
+        log.info(f"Importing {len(numbers)} numbers")
+        res = await client(ImportContactsRequest(contacts))
 
-    except ValueError:
-        try:
-            contact = InputPhoneContact(
-                client_id=0,
-                phone=number,
-                first_name="Temp",
-                last_name="User"
-            )
+    except FloodWaitError as e:
+        log.warning(f"FloodWait {e.seconds}s — sleeping")
+        await asyncio.sleep(e.seconds)
+        return await check_batch(numbers)
 
-            await client(ImportContactsRequest([contact]))
-            user = await client.get_entity(number)
+    except Exception as e:
+        log.error(f"Import failed: {e}")
+        for n in numbers:
+            results[n] = {"exists": False, "error": "import_failed"}
+        return results
 
-            try:
-                await client(DeleteContactsRequest([user]))
-            except Exception:
-                pass
+    found = {u.phone: u for u in res.users}
 
-            return {number: format_user(user, temp=True)}
+    for num in numbers:
+        if num in found:
+            results[num] = format_user(found[num])
+        else:
+            results[num] = {"exists": False}
 
-        except Exception:
-            return {number: {"exists": False}}
-
+    # cleanup contacts
+    try:
+        await client(DeleteContactsRequest(res.users))
     except Exception:
-        return {number: {"exists": False}}
+        pass
+
+    return results
 
 # ======================
-# API
+# API ENDPOINT
 # ======================
 @app.post("/check")
 async def check_numbers(request: PhoneNumberRequest):
-
     if not request.phone_numbers:
         raise HTTPException(400, "phone_numbers list is empty")
 
     numbers = request.phone_numbers[:30]
-
     results = {}
 
-    # 🔒 LOCK prevents DB locked error
     async with client_lock:
-        for n in numbers:
-            res = await check_number(n)
-            results.update(res)
+        for i in range(0, len(numbers), MAX_BATCH):
+            batch = numbers[i:i + MAX_BATCH]
+            batch_result = await check_batch(batch)
+            results.update(batch_result)
+            await asyncio.sleep(BATCH_DELAY)
 
     return {
         "status": True,
